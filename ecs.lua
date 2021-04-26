@@ -1,167 +1,238 @@
-local ecs = {}
--- System
-function ecs.NewSystem( self )
-    self = self or {}
-    return self
-end
+local function table_encode(...)
+    local node = {...}
+    if #node == 1 and type(node[1]) == 'table' then
+        node = node[1]
+    end
+    -- to make output beautiful
+    local function tab(amt)
+        local str = ""
+        for i = 1, amt do
+            str = str .. "  "
+        end
+        return str
+    end
 
--- World
-function ecs.NewWorld(...)
-    local self = {
-        -- system
-        systems         = {},
-        systemsToAdd    = {},
-        systemsToRemove = {},
-        -- entity
-        entities         = {},
-        entitiesToAdd    = {},
-        entitiesToRemove = {},
-    }
-    local function handleSystem()
-        local toRemove = self.systemsToRemove
-        local toAdd    = self.systemsToAdd
-        local container= self.systems
-        if #toRemove == 0 and #toAdd == 0 then
-            return
+    local cache, stack, output = {}, {}, {}
+    local depth = 1
+    local output_str = "{\n"
+
+    while true do
+        local size = 0
+        for k, v in pairs(node) do
+            size = size + 1
         end
-        self.systemsToAdd = {}
-        self.systemsToRemove = {}
-        -- do remove
-        for i,sys in ipairs(toRemove) do
-            local index = sys.index
-            table.remove(container, index)
-            -- reset array tail system's index
-            for j=index,#container do
-                container[j].index = j
+
+        local cur_index = 1
+        for k, v in pairs(node) do
+            if (cache[node] == nil) or (cur_index >= cache[node]) then
+
+                if (string.find(output_str, "}", output_str:len())) then
+                    output_str = output_str .. ",\n"
+                elseif not (string.find(output_str, "\n", output_str:len())) then
+                    output_str = output_str .. "\n"
+                end
+
+                -- This is necessary for working with HUGE tables otherwise we run out of memory using concat on huge strings
+                table.insert(output, output_str)
+                output_str = ""
+
+                local key
+                if (type(k) == "number" or type(k) == "boolean") then
+                    key = "["..tostring(k) .. "]"
+                else
+                    key = "['"..tostring(k) .. "']"
+                end
+
+                if (type(v) == "number" or type(v) == "boolean") then
+                    output_str = output_str .. tab(depth) .. key .. " = "..tostring(v)
+                elseif (type(v) == "table") then
+                    output_str = output_str .. tab(depth) .. key .. " = {\n"
+                    table.insert(stack, node)
+                    table.insert(stack, v)
+                    cache[node] = cur_index + 1
+                    break
+                else
+                    output_str = output_str .. tab(depth) .. key .. " = '"..tostring(v) .. "'"
+                end
+
+                if (cur_index == size) then
+                    output_str = output_str .. "\n" .. tab(depth) .. "}"
+                else
+                    output_str = output_str .. ","
+                end
+            else
+                -- close the table
+                if (cur_index == size) then
+                    output_str = output_str .. "\n" .. tab(depth) .. "}"
+                end
             end
-            if self.OnRemoveSystem then
-                self.OnRemoveSystem( sys )
-            end
+
+            cur_index = cur_index + 1
         end
-        -- do add
-        for i,sys in ipairs(toAdd) do
-            local index = #container + 1
-            sys.world = self
-            sys.index = index
-            if sys.active == nil then
-                sys.active = true
-            end
-            container[index] = sys
-            if self.OnAddSystem then
-                self.OnAddSystem( sys )
-            end
+
+        if (size == 0) then
+            output_str = output_str .. "\n" .. tab(depth) .. "}"
+        end
+
+        if (#stack > 0) then
+            node = stack[#stack]
+            stack[#stack] = nil
+            depth = cache[node] == nil and depth + 1 or depth - 1
+        else
+            break
         end
     end
 
-    local function handleEntity()
-        local toRemove = self.entitiesToRemove
-        local toAdd    = self.entitiesToAdd
-        local container= self.entities
-        if #toRemove == 0 and #toAdd == 0 then
-            return
-        end
-        self.entitiesToAdd = {}
-        self.entitiesToRemove = {}
-        -- do remove
-        for i,entity in ipairs(toRemove) do
-            for j,v in ipairs(container) do
-                if entity == v then
-                    table.remove(container, j)
+    -- This is necessary for working with HUGE tables otherwise we run out of memory using concat on huge strings
+    table.insert(output, output_str)
+    output_str = table.concat(output)
+
+    --print(output_str)
+    return output_str
+end
+
+
+local ecs = {}
+local MTReadonly = {
+    __newindex = function ()
+    end
+}
+function ecs.NewManager()
+    local self = {}
+    local entityId = 1
+    local allEntities  = {} -- map[entity][entity]
+    local allSystem    = {} -- system array
+    local allComponent = {} -- map[component type] map[entity] component
+    local frameCount = 1
+    -- system
+    local addSys = {}
+    local remSys = {}
+    local function handleSystemRemove()
+        if #remSys == 0 then return end
+        local keep = {}
+        for _, v1 in ipairs(allSystem) do
+            local match = false
+            for _, v2 in ipairs(remSys) do
+                if v1 == v2 then -- match remove
+                    match = true
                     break
                 end
             end
+            if not match then
+                table.insert(keep, v1)
+            end
         end
-        -- do add
-        for i,entity in ipairs(toAdd) do
-            local index = #container + 1
-            container[index] = entity
-            if self.OnAddEntity then
-                self.OnAddEntity( entity )
+        allSystem = keep
+        remSys = {}
+    end
+    local function handleSystemAdd()
+        if #addSys == 0 then return end
+        for _, value in ipairs(addSys) do
+            table.insert(allSystem, value)
+        end
+        addSys = {}
+    end
+    local function handleSystemUpdate()
+        for _, sys in ipairs(allSystem) do
+            if sys.Update then
+                sys.Update(self)
             end
         end
     end
-
-    local function updateSystem( system, dt )
-        system.entities = {}
-        local filter = system.Filter
-        if filter then
-            local entities = system.world.entities
-            for i,entity in ipairs(entities) do
-                if filter( entity ) then
-                    table.insert(system.entities, entity)
-                end
+    -- entity
+    function self.Update()
+        handleSystemRemove()
+        handleSystemAdd()
+        handleSystemUpdate()
+        frameCount = frameCount + 1
+    end
+    
+    function self.NewEntity()
+        local id = entityId
+        if allEntities[id] then -- id has been used
+            entityId = entityId + 1
+            return self.NewEntity()
+        end
+        allEntities[id] = id
+        entityId = entityId + 1
+        return id
+    end
+    function self.RemoveEntity(e)
+        allEntities[e] = nil
+    end
+    function self.AddSystem(sys)
+        if type(sys.Update) ~= "function" then return end
+        table.insert(addSys, sys)
+    end
+    function self.handleRemoveSystem(sys)
+        if type(sys.Update) ~= "function" then return end
+        table.insert(remSys, sys)
+    end
+    -- component
+    function self.AddComponent(e, c, t)
+        local entMap = allComponent[t]
+        if not entMap then
+            entMap = {}
+            allComponent[t] = entMap
+        end
+        entMap[e] = c
+    end
+    function self.RemoveComponent(e, t)
+        local entMap = allComponent[t]
+        if not entMap then
+            return
+        end
+        entMap[e] = nil
+    end
+    function self.GetComponent(e, t)
+        local entMap = allComponent[t]
+        if not entMap then
+            return nil
+        end
+        if not allEntities[e] then
+            return nil
+        end
+        return entMap[e]
+    end
+    function self.GetAllComponent(t)
+        local entMap = allComponent[t]
+        if not entMap then
+            return {}
+        end
+        local entities = {}
+        local comps = {}
+        for entity, comp in pairs(entMap) do
+            if allEntities[entity] then -- still alive
+                table.insert(entities, entity)
+                table.insert(comps, comp)
+            else
+                entMap[entity] = nil
             end
         end
-
-        system.Update( dt )
+        return entities, comps
     end
-
-    local function invokeUpdate( dt )
-        local systems = self.systems
-
-        -- PreUpdate
-        for _,system in ipairs(systems) do
-            if system.active and system.PreUpdate then
-                system.PreUpdate( dt )
-            end
-        end
-        -- Update
-        for _,system in ipairs(systems) do
-            if system.active and system.Update then
-                updateSystem(system, dt)
-            end
-        end
-        -- PostUpdate
-        for _,system in ipairs(systems) do
-            if system.active and system.PostUpdate then
-                system.PostUpdate( dt )
-            end
-        end
+    function self.GetFrameCount()
+        return frameCount
     end
-
-    function self.AddSystem( sys )
-        local i = #self.systemsToAdd
-        self.systemsToAdd[i+1] = sys
-        sys.world = self
-        return sys
+    function self.Encode()
+        local obj = {
+            frameCount   = frameCount,
+            allEntities  = allEntities,
+            allComponent = allComponent,
+        }
+        return table_encode(obj)
     end
-    function self.RemoveSystem( sys )
-        local i = #self.systemsToRemove
-        self.systemsToRemove[i+1] = sys
-        return sys
+    function self.Decode(data)
+        if type(data) ~= "string" then return end
+        local obj = load('return '..data)
+        if not obj then return end
+        obj = obj()
+        allEntities  = obj.allEntities or {}
+        allComponent = obj.allComponent or {}
+        frameCount   = obj.frameCount or 0
     end
-    function self.AddEntity( e )
-        local i = #self.entitiesToAdd
-        self.entitiesToAdd[i+1] = e
-        return e
-    end
-    function self.RemoveEntity( e )
-        local i = #self.entitiesToRemove
-        self.entitiesToRemove[i+1] = e
-        return e
-    end
-
-    function self.Update( dt )
-        handleSystem()
-        handleEntity()
-        --
-        invokeUpdate( dt )
-    end
-
-    function self.SetSystemIndex( system, index )
-        local oldIndex = system.index
-        table.remove(self.systems, oldIndex)
-        table.insert(self.systems, index, system)
-        for i = oldIndex, index, index >= oldIndex and 1 or -1 do
-            self.systems[i].index = i
-        end
-    end
-
-    for i = 1, select('#', ...) do
-        local sys = select(i, ...)
-        self.AddSystem(sys)
-    end
+    setmetatable(self, MTReadonly)
     return self
+    
 end
-
 return ecs
